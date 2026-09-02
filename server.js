@@ -122,6 +122,5 @@ app.post("/api/admin/bank",requireAdmin,(req,res)=>{
 app.get("/api/bank",requireUser,(req,res)=>res.json(db.prepare("SELECT bank_name as bankName,account_name as accountName,account_number as accountNumber,bank_code as bankCode FROM bank_details WHERE id=1").get()||{}));
 
 app.get("/api/transactions",requireUser,(req,res)=>res.json(db.prepare("SELECT * FROM transactions WHERE user_id=? ORDER BY created_at DESC").all(req.session.userId)));
-app.use(express.static(path.join(__dirname,"public")));
-
+app.use(express.static(__dirname));
 app.listen(process.env.PORT||3000,()=>console.log("TradingPlatformPayout running on port "+(process.env.PORT||3000)));
