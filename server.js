@@ -1,127 +1,36 @@
-const express = require("express");
-const session = require("express-session");
-const bcrypt = require("bcryptjs");
-const Database = require("better-sqlite3");
-const path = require("path");
-
-const app = express();
-const db = new Database(path.join(__dirname, "tradingplatformpayout.db"));
-db.pragma("journal_mode = WAL");
-
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- name TEXT NOT NULL,
- phone TEXT,
- country TEXT,
- email TEXT UNIQUE NOT NULL,
- password_hash TEXT NOT NULL,
- status TEXT NOT NULL DEFAULT 'pending',
- deposit_balance REAL NOT NULL DEFAULT 0,
- profit_balance REAL NOT NULL DEFAULT 0,
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS bank_details (
- id INTEGER PRIMARY KEY CHECK (id=1),
- bank_name TEXT NOT NULL DEFAULT '',
- account_name TEXT NOT NULL DEFAULT '',
- account_number TEXT NOT NULL DEFAULT '',
- bank_code TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS transactions (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- user_id INTEGER NOT NULL,
- type TEXT NOT NULL,
- amount REAL NOT NULL,
- status TEXT NOT NULL DEFAULT 'pending',
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- FOREIGN KEY(user_id) REFERENCES users(id)
-);
-`);
-
-const adminEmail = process.env.ADMIN_EMAIL || "admin@tradingplatformpayout.local";
-const adminPassword = process.env.ADMIN_PASSWORD || "CHANGE_THIS_ADMIN_PASSWORD";
-
-app.use(express.json());
-app.use(express.urlencoded({extended:true}));
-app.use(session({
- secret: process.env.SESSION_SECRET || "change-this-session-secret",
- resave:false, saveUninitialized:false,
- cookie:{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production"}
-}));
-
-function userView(u){
- return {id:u.id,name:u.name,phone:u.phone,country:u.country,email:u.email,status:u.status,
-   depositBalance:u.deposit_balance,profitBalance:u.profit_balance,
-   totalBalance:u.deposit_balance+u.profit_balance,createdAt:u.created_at};
-}
-function requireUser(req,res,next){if(!req.session.userId)return res.status(401).json({error:"Login required"});next();}
-function requireAdmin(req,res,next){if(!req.session.admin)return res.status(403).json({error:"Administrator access required"});next();}
-
-app.post("/api/register", async (req,res)=>{
- const {name,phone,country,email,password}=req.body;
- if(!name||!email||!password)return res.status(400).json({error:"Name, email and password are required"});
- try{
-   const hash=await bcrypt.hash(password,12);
-   const info=db.prepare("INSERT INTO users(name,phone,country,email,password_hash) VALUES(?,?,?,?,?)")
-     .run(name.trim(),phone||"",country||"",email.trim().toLowerCase(),hash);
-   res.json({ok:true,id:info.lastInsertRowid,status:"pending"});
- }catch(e){res.status(400).json({error:e.code==="SQLITE_CONSTRAINT_UNIQUE"?"Email is already registered":"Registration failed"});}
-});
-
-app.post("/api/login", async (req,res)=>{
- const {email,password}=req.body;
- if(email===adminEmail && password===adminPassword){
-   req.session.admin=true; delete req.session.userId; return res.json({ok:true,role:"admin"});
- }
- const u=db.prepare("SELECT * FROM users WHERE email=?").get((email||"").trim().toLowerCase());
- if(!u || !(await bcrypt.compare(password||"",u.password_hash)))return res.status(401).json({error:"Incorrect email or password"});
- if(u.status!=="approved")return res.status(403).json({error:`Account is ${u.status}.`});
- req.session.userId=u.id; delete req.session.admin;
- res.json({ok:true,role:"user",user:userView(u)});
-});
-
-app.post("/api/logout",(req,res)=>req.session.destroy(()=>res.json({ok:true})));
-
-app.get("/api/me",(req,res)=>{
- if(req.session.admin)return res.json({role:"admin"});
- if(req.session.userId){const u=db.prepare("SELECT * FROM users WHERE id=?").get(req.session.userId);return res.json({role:"user",user:userView(u)});}
- res.status(401).json({error:"Not logged in"});
-});
-
-app.get("/api/admin/users",requireAdmin,(req,res)=>{
- res.json(db.prepare("SELECT * FROM users ORDER BY created_at DESC").all().map(userView));
-});
-app.post("/api/admin/users/:id/status",requireAdmin,(req,res)=>{
- const {status}=req.body;if(!["approved","rejected","pending"].includes(status))return res.status(400).json({error:"Invalid status"});
- const info=db.prepare("UPDATE users SET status=? WHERE id=?").run(status,req.params.id);
- if(!info.changes)return res.status(404).json({error:"User not found"});
- res.json({ok:true});
-});
-app.post("/api/admin/users/:id/balance",requireAdmin,(req,res)=>{
- const {type,amount}=req.body;
- if(!["deposit","profit"].includes(type)||!Number.isFinite(Number(amount)))return res.status(400).json({error:"Invalid balance change"});
- const column=type==="deposit"?"deposit_balance":"profit_balance";
- const u=db.prepare("SELECT * FROM users WHERE id=?").get(req.params.id);
- if(!u)return res.status(404).json({error:"User not found"});
- const next=u[column]+Number(amount);
- if(next<0)return res.status(400).json({error:"Balance cannot go below zero"});
- db.prepare(`UPDATE users SET ${column}=? WHERE id=?`).run(next,u.id);
- const updated=db.prepare("SELECT * FROM users WHERE id=?").get(u.id);
- res.json({ok:true,user:userView(updated)});
-});
-
-app.get("/api/admin/bank",requireAdmin,(req,res)=>res.json(db.prepare("SELECT * FROM bank_details WHERE id=1").get()||{}));
-app.post("/api/admin/bank",requireAdmin,(req,res)=>{
- const {bankName,accountName,accountNumber,bankCode}=req.body;
- db.prepare(`INSERT INTO bank_details(id,bank_name,account_name,account_number,bank_code)
- VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET bank_name=excluded.bank_name,account_name=excluded.account_name,account_number=excluded.account_number,bank_code=excluded.bank_code`)
- .run(bankName||"",accountName||"",accountNumber||"",bankCode||"");
- res.json({ok:true});
-});
-app.get("/api/bank",requireUser,(req,res)=>res.json(db.prepare("SELECT bank_name as bankName,account_name as accountName,account_number as accountNumber,bank_code as bankCode FROM bank_details WHERE id=1").get()||{}));
-
-app.get("/api/transactions",requireUser,(req,res)=>res.json(db.prepare("SELECT * FROM transactions WHERE user_id=? ORDER BY created_at DESC").all(req.session.userId)));
-app.use(express.static(path.join(__dirname,"public")));
-
-app.listen(process.env.PORT||3000,()=>console.log("TradingPlatformPayout running on port "+(process.env.PORT||3000)));
+const express=require("express"),session=require("express-session"),bcrypt=require("bcryptjs"),Database=require("better-sqlite3"),path=require("path");
+const app=express(),PORT=process.env.PORT||10000,db=new Database(process.env.DB_PATH||path.join(__dirname,"digitalmarket.sqlite"));
+db.pragma("journal_mode=WAL");
+db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,country TEXT NOT NULL,currency TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'user',status TEXT NOT NULL DEFAULT 'pending',deposit_balance REAL NOT NULL DEFAULT 0,profit_balance REAL NOT NULL DEFAULT 0,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,type TEXT NOT NULL,amount REAL NOT NULL,status TEXT NOT NULL,note TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,message TEXT NOT NULL,read INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);`);
+const C={Nigeria:["NGN","₦"],Ghana:["GHS","₵"],Philippines:["PHP","₱"],UK:["GBP","£"],US:["USD","$"]};
+function s(k,d=""){let x=db.prepare("SELECT value FROM settings WHERE key=?").get(k);return x?x.value:d}
+function ss(k,v){db.prepare("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(k,String(v))}
+ss("bank_name",s("bank_name","TEST / SIMULATOR BANK"));ss("account_holder",s("account_holder","DIGITALMARKET TEST ACCOUNT"));ss("account_number",s("account_number","TEST-ACCOUNT-0000"));ss("bank_code",s("bank_code","TEST-CODE"));
+const ae=process.env.ADMIN_EMAIL||"admin@digitalmarket.com",ap=process.env.ADMIN_PASSWORD||"ChangeMe123!";
+if(!db.prepare("SELECT id FROM users WHERE email=?").get(ae))db.prepare("INSERT INTO users(name,email,password_hash,country,currency,role,status) VALUES(?,?,?,?,?,'admin','approved')").run("Simulator Administrator",ae,bcrypt.hashSync(ap,12),"Nigeria","NGN");
+app.use(express.urlencoded({extended:true}));app.use(express.json());app.use(session({secret:process.env.SESSION_SECRET||"change-this-secret",resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:28800000}}));app.use(express.static(path.join(__dirname,"public")));
+const U=r=>db.prepare("SELECT * FROM users WHERE id=?").get(r.session.userId),auth=(r,q,n)=>r.session.userId?q():r.redirect("/login"),admin=(r,q,n)=>{let u=U(r);return u&&u.role==="admin"?q():r.status(403).send("Admin access required.")};
+const money=x=>new Intl.NumberFormat("en-US",{minimumFractionDigits:2,maximumFractionDigits:2}).format(Number(x||0));
+function notify(id,m){db.prepare("INSERT INTO notifications(user_id,message) VALUES(?,?)").run(id,m)}
+function page(t,b,u){return `<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>${t} · DigitalMarket</title><link rel=stylesheet href=/styles.css></head><body><header><b>digitalmarket<span>.com</span></b><em>PAPER TRADING SIMULATOR</em></header>${u?`<nav><a href=/dashboard>Dashboard</a><a href=/deposit>Deposit</a><a href=/withdraw>Withdraw</a><a href=/transactions>Transactions</a><a href=/profile>Profile</a>${u.role==="admin"?`<a href=/admin>Admin</a>`:""}<a href=/logout>Logout</a></nav>`:""}<main>${b}</main><footer>Simulation only — no real money or real payment processing.</footer></body></html>`}
+app.get("/",(r,z)=>r.session.userId?z.redirect("/dashboard"):z.send(page("Welcome",`<section class=hero><h1>DigitalMarket.com</h1><p>Paper-trading and simulated payout environment.</p><a class=btn href=/register>Create account</a> <a class="btn secondary" href=/login>Sign in</a><div class=notice>Simulation only. Approved accounts begin at 0.00.</div></section>`)));
+app.get("/register",(r,z)=>z.send(page("Create account",`<div class="card narrow"><h2>Create simulator account</h2><form method=post><label>Full name<input name=name required></label><label>Email<input type=email name=email required></label><label>Password<input type=password name=password minlength=8 required></label><label>Country<select name=country>${Object.keys(C).map(x=>`<option>${x}</option>`).join("")}</select></label><div class=notice>Country selection determines currency automatically. Account remains pending until approved.</div><button class=btn>Create account</button></form></div>`)));
+app.post("/register",(r,z)=>{let {name,email,password,country}=r.body;if(!C[country])return z.status(400).send("Unsupported country");try{let id=db.prepare("INSERT INTO users(name,email,password_hash,country,currency) VALUES(?,?,?,?,?)").run(name.trim(),email.trim().toLowerCase(),bcrypt.hashSync(password,12),country,C[country][0]).lastInsertRowid;notify(id,"Account created. Waiting for simulator administrator approval.");z.send(page("Created",`<div class="card narrow"><h2>Account created</h2><p>After approval, your starting balance is ${C[country][1]}0.00.</p><a class=btn href=/login>Sign in</a></div>`))}catch(e){z.status(400).send(page("Error",`<div class=card><h2>Could not create account</h2><p>Email may already be registered.</p><a href=/register>Try again</a></div>`))}});
+app.get("/login",(r,z)=>z.send(page("Sign in",`<div class="card narrow"><h2>Sign in</h2><form method=post><label>Email<input type=email name=email required></label><label>Password<input type=password name=password required></label><button class=btn>Sign in</button></form></div>`)));
+app.post("/login",(r,z)=>{let u=db.prepare("SELECT * FROM users WHERE email=?").get(r.body.email.trim().toLowerCase());if(!u||!bcrypt.compareSync(r.body.password,u.password_hash))return z.status(401).send("Invalid login");if(u.status!=="approved"&&u.role!=="admin")return z.status(403).send(page("Pending",`<div class="card narrow"><h2>Pending approval</h2><p>Your simulator account is waiting for administrator approval.</p></div>`));r.session.userId=u.id;z.redirect("/dashboard")});
+app.get("/logout",(r,z)=>r.session.destroy(()=>z.redirect("/")));
+app.get("/dashboard",(r,z)=>auth(r,()=>{let u=U(r),sym=C[u.country][1],tx=db.prepare("SELECT * FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 5").all(u.id),ns=db.prepare("SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 4").all(u.id);z.send(page("Dashboard",`<div class=top><div><h1>Welcome, ${u.name}</h1><span class=pill>SIMULATION / PAPER TRADING</span></div><b>${u.currency} · ${sym}</b></div><div class=grid><div class="balance card"><small>TOTAL BALANCE</small><strong>${sym}${money(u.deposit_balance+u.profit_balance)}</strong><div class=split><span>Deposit balance<br><b>${sym}${money(u.deposit_balance)}</b></span><span>Simulated profit<br><b>${sym}${money(u.profit_balance)}</b></span></div></div><div class="card signal"><small>SIGNAL STRENGTH</small><strong>SIMULATED</strong><div class=meter><i></i></div><p>Demo market/signal information only.</p></div></div><div class=grid><div class=card><h3>Deposit / withdrawal</h3><p>Submit simulated requests and track status.</p><a class=btn href=/deposit>Deposit</a> <a class="btn secondary" href=/withdraw>Withdraw</a></div><div class=card><h3>Market</h3><p>Paper-trading market section. No live execution.</p></div></div><div class=grid><div class=card><h3>Recent transactions</h3>${tx.length?tx.map(t=>`<div class=row><span>${t.type}<small>${t.created_at}</small></span><b>${sym}${money(t.amount)}<small>${t.status}</small></b></div>`).join(""):"<p class=muted>No transactions yet.</p>"}</div><div class=card><h3>Notifications</h3>${ns.length?ns.map(n=>`<div class=note>${n.message}<small>${n.created_at}</small></div>`).join(""):"<p class=muted>No notifications.</p>"}</div></div>`,u)}));
+function req(type){return `<div class="card narrow"><h2>Simulated ${type}</h2><div class=warning>TEST/SIMULATOR ONLY — not real payment instructions.</div>${type==="Deposit"?`<div class=bank><b>COMPANY TRADING ACCOUNT DETAILS — TEST/SIMULATOR</b><p>Bank: ${s("bank_name")}</p><p>Account holder: ${s("account_holder")}</p><p>Account number: ${s("account_number")}</p><p>Bank code: ${s("bank_code")}</p></div>`:""}<form method=post><label>Amount<input name=amount type=number min=.01 step=.01 required></label><label>Note<textarea name=note rows=3></textarea></label><button class=btn>Submit simulated request</button></form></div>`}
+app.get("/deposit",(r,z)=>auth(r,()=>z.send(page("Deposit",req("Deposit"),U(r)))));app.post("/deposit",(r,z)=>auth(r,()=>{let u=U(r),a=Number(r.body.amount);if(!(a>0))return z.status(400).send("Invalid amount");db.prepare("INSERT INTO transactions(user_id,type,amount,status,note) VALUES(?,?,?,?,?)").run(u.id,"Deposit request",a,"Pending",r.body.note||"");notify(u.id,`Simulated deposit request for ${C[u.country][1]}${money(a)} submitted.`);z.redirect("/transactions")}));
+app.get("/withdraw",(r,z)=>auth(r,()=>z.send(page("Withdraw",req("Withdrawal"),U(r))));app.post("/withdraw",(r,z)=>auth(r,()=>{let u=U(r),a=Number(r.body.amount);if(!(a>0))return z.status(400).send("Invalid amount");db.prepare("INSERT INTO transactions(user_id,type,amount,status,note) VALUES(?,?,?,?,?)").run(u.id,"Withdrawal request",a,"Pending",r.body.note||"");notify(u.id,`Simulated withdrawal request for ${C[u.country][1]}${money(a)} submitted.`);z.redirect("/transactions")}));
+app.get("/transactions",(r,z)=>auth(r,()=>{let u=U(r),tx=db.prepare("SELECT * FROM transactions WHERE user_id=? ORDER BY id DESC").all(u.id),sym=C[u.country][1];z.send(page("Transactions",`<div class=card><h2>Transaction history</h2>${tx.length?tx.map(t=>`<div class=row><span><b>${t.type}</b><small>${t.note||""}<br>${t.created_at}</small></span><span>${sym}${money(t.amount)}<small>${t.status}</small></span></div>`).join(""):"<p class=muted>No transactions yet.</p>"}</div>`,u))}));
+app.get("/profile",(r,z)=>auth(r,()=>{let u=U(r);z.send(page("Profile",`<div class="card narrow"><h2>User profile</h2><p><b>Name</b><br>${u.name}</p><p><b>Email</b><br>${u.email}</p><p><b>Country / currency</b><br>${u.country} · ${u.currency}</p><p><b>Status</b><br>${u.status}</p><h3>Bank details</h3><div class=warning>VIEW-ONLY TEST/SIMULATOR DETAILS.</div><div class=bank><p>${s("bank_name")}</p><p>${s("account_holder")}</p><p>${s("account_number")}</p><p>${s("bank_code")}</p></div></div>`,u))});
+app.get("/admin",(r,z)=>admin(r,()=>{let us=db.prepare("SELECT * FROM users WHERE role='user' ORDER BY id DESC").all(),tx=db.prepare("SELECT t.*,u.name,u.email,u.currency FROM transactions t JOIN users u ON u.id=t.user_id WHERE t.status='Pending' ORDER BY t.id DESC").all();z.send(page("Admin",`<h1>Simulator administration</h1><div class=card><h2>Deposit instructions</h2><form method=post action=/admin/settings class=grid><input name=bank_name value="${s("bank_name")}"><input name=account_holder value="${s("account_holder")}"><input name=account_number value="${s("account_number")}"><input name=bank_code value="${s("bank_code")}"><button class=btn>Save test details</button></form></div><div class=card><h2>User accounts</h2>${us.map(u=>`<div class=admin><div><b>${u.name}</b><small>${u.email} · ${u.country} · ${u.currency} · ${u.status}</small></div><form method=post action=/admin/user/${u.id}/approve><button class=btn ${u.status==="approved"?"disabled":""}>${u.status==="approved"?"Approved":"Approve"}</button></form><form method=post action=/admin/user/${u.id}/balance><input name=deposit_balance type=number step=.01 value=${u.deposit_balance}><input name=profit_balance type=number step=.01 value=${u.profit_balance}><button class=btn>Set balances</button></form></div>`).join("")||"<p>No users.</p>"}</div><div class=card><h2>Pending requests</h2>${tx.map(t=>`<div class=admin><div><b>${t.type}</b><small>${t.name} · ${t.email}</small></div><form method=post action=/admin/tx/${t.id}/status><select name=status><option>Approved</option><option>Rejected</option></select><button class=btn>Update</button></form></div>`).join("")||"<p class=muted>No pending requests.</p>"}</div>`,U(r))}));
+app.post("/admin/settings",(r,z)=>admin(r,()=>{["bank_name","account_holder","account_number","bank_code"].forEach(k=>ss(k,r.body[k]||""));z.redirect("/admin")}));
+app.post("/admin/user/:id/approve",(r,z)=>admin(r,()=>{let id=+r.params.id;db.prepare("UPDATE users SET status='approved',deposit_balance=0,profit_balance=0 WHERE id=?").run(id);notify(id,"Your simulator account has been approved. Starting balance is 0.00.");z.redirect("/admin")}));
+app.post("/admin/user/:id/balance",(r,z)=>admin(r,()=>{let d=Number(r.body.deposit_balance),p=Number(r.body.profit_balance),id=+r.params.id;if(d<0||p<0||!Number.isFinite(d)||!Number.isFinite(p))return z.status(400).send("Invalid balance");db.prepare("UPDATE users SET deposit_balance=?,profit_balance=? WHERE id=?").run(d,p,id);notify(id,"Your simulated balance was updated by the administrator.");z.redirect("/admin")}));
+app.post("/admin/tx/:id/status",(r,z)=>admin(r,()=>{let t=db.prepare("SELECT * FROM transactions WHERE id=?").get(+r.params.id);if(!t||!["Approved","Rejected"].includes(r.body.status))return z.status(400).send("Invalid request");db.prepare("UPDATE transactions SET status=? WHERE id=?").run(r.body.status,t.id);notify(t.user_id,`Your ${t.type.toLowerCase()} was ${r.body.status.toLowerCase()} in the simulator.`);z.redirect("/admin")}));
+app.listen(PORT,()=>console.log("DigitalMarket simulator listening on "+PORT));

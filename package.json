@@ -1,14 +1,14 @@
 {
-  "name": "tradingplatformpayout-shared",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^11.10.0",
-    "express": "^5.1.0",
-    "express-session": "^1.18.2"
+  "name":"digitalmarket-paper-trading-simulator",
+  "version":"1.0.0",
+  "private":true,
+  "description":"DigitalMarket.com paper-trading and simulated payout dashboard.",
+  "engines":{"node":"22.x"},
+  "scripts":{"start":"node server.js"},
+  "dependencies":{
+    "bcryptjs":"^2.4.3",
+    "better-sqlite3":"^11.10.0",
+    "express":"^5.1.0",
+    "express-session":"^1.18.2"
   }
 }
